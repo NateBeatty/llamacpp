@@ -67,13 +67,26 @@ static ggml_backend_buffer_type_t migrate_pick_buft(
 bool llama_model_migrate_impl(struct llama_model * model, int32_t new_n_gpu_layers,
                               const llama_model_tensor_buft_override * overrides) {
     const int    n_layer = (int)model->hparams.n_layer;
-    const size_t nd      = model->n_devices();
 
     ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (!cpu_dev) {
         LLAMA_LOG_ERROR("%s: no CPU backend found\n", __func__);
         return false;
     }
+
+    // ── 0. Save/restore model->devices so context creation skips the CUDA
+    //       backend (and its scratch buffer allocation) when fully on CPU ────
+
+    const bool going_cpu = (new_n_gpu_layers == 0);
+    const bool was_cpu   = model->devices.empty() && !model->pimpl->saved_devices.empty();
+
+    if (!going_cpu && was_cpu) {
+        // Migrating back to GPU: restore device list before computing splits.
+        model->devices = std::move(model->pimpl->saved_devices);
+        model->pimpl->saved_devices.clear();
+    }
+
+    const size_t nd = model->n_devices();
 
     // ── 1. Recompute layer-to-device assignments ──────────────────────────
 
@@ -257,6 +270,17 @@ bool llama_model_migrate_impl(struct llama_model * model, int32_t new_n_gpu_laye
     // ── 6. Persist the new GPU layer count in model params ────────────────
 
     model->params.n_gpu_layers = new_n_gpu_layers;
+
+    // ── 7. Clear/restore model->devices for CUDA scratch elimination ──────
+    // When fully on CPU, clear model->devices so that llama_init_from_model
+    // does not add the CUDA backend to the scheduler and pre-allocate its
+    // scratch buffers (~2GB).  The list is saved in pimpl and restored on
+    // the next GPU migration.
+
+    if (going_cpu && !model->devices.empty()) {
+        model->pimpl->saved_devices = std::move(model->devices);
+        model->devices.clear();
+    }
 
     LLAMA_LOG_INFO("%s: model weights migrated (n_gpu_layers = %d)\n",
                    __func__, new_n_gpu_layers);

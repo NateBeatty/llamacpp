@@ -2194,9 +2194,41 @@ private:
                     llama_init->reset_context(std::move(new_ctx));
                     ctx_tgt = llama_init->context();
 
+                    // Migrate the draft/MTP model if one is loaded.
+                    if (model_dft) {
+                        ctx_dft.reset();  // free old draft context first
+
+                        if (!llama_model_migrate(model_dft.get(), n_gpu, overrides)) {
+                            SRV_WRN("%s", "draft model migration failed — draft context will be unavailable\n");
+                        } else {
+                            auto cparams_dft = common_context_params_to_llama(params_base);
+                            llama_context_ptr new_ctx_dft(llama_init_from_model(model_dft.get(), cparams_dft));
+                            if (new_ctx_dft) {
+                                ctx_dft = std::move(new_ctx_dft);
+                            } else {
+                                SRV_WRN("%s", "failed to recreate draft context after migration\n");
+                            }
+                        }
+
+                        // Repoint speculative params and reinitialize the speculator.
+                        params_base.speculative.draft.ctx_tgt = ctx_tgt;
+                        params_base.speculative.draft.ctx_dft = ctx_dft.get();
+
+                        spec.reset();
+                        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+                            try {
+                                spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
+                            } catch (const std::exception & e) {
+                                SRV_WRN("failed to reinitialize speculative decoding after migration: %s\n", e.what());
+                            }
+                        }
+                    }
+
                     // Reset all slot state — KV entries from the old context are gone.
                     for (auto & slot : slots) {
                         slot.ctx_tgt = ctx_tgt;
+                        slot.ctx_dft = ctx_dft.get();
+                        slot.spec    = spec.get();
                         slot.reset();
                     }
 
