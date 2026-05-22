@@ -19,6 +19,7 @@
 *.o
 *.so
 *.swp
+*.swo
 *.tmp
 *.DS_Store
 
@@ -102,6 +103,7 @@
 # Python
 
 /.venv
+*.pyc
 __pycache__/
 */poetry.lock
 poetry.toml
@@ -160,3 +162,8 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# IDE (continued)
+
+/.clion/
+/.cmakeide/

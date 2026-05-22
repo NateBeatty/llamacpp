@@ -633,6 +633,10 @@ protected:
 
     struct impl;
     std::unique_ptr<impl> pimpl;
+
+private:
+    // Grants llama-migrate.cpp direct access to pimpl for hot-swap functionality.
+    friend bool llama_model_migrate_impl(struct llama_model * model, int32_t new_n_gpu_layers, const struct llama_model_tensor_buft_override * overrides);
 };
 
 llama_model * llama_model_create(llm_arch arch, const llama_model_params & params);

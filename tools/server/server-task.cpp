@@ -1959,6 +1959,16 @@ json server_task_result_apply_lora::to_json() {
     return json {{ "success", true }};
 }
 
+// server_task_result_migrate
+
+json server_task_result_migrate::to_json() {
+    json j = {{"success", success}, {"n_gpu_layers", n_gpu_layers}};
+    if (!error.empty()) {
+        j["error"] = error;
+    }
+    return j;
+}
+
 //
 // server_prompt_cache
 //
