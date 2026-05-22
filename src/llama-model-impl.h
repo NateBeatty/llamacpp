@@ -41,4 +41,9 @@ struct llama_model::impl {
     std::vector<layer_dev> dev_layer;
 
     bool has_tensor_overrides;
+
+    // Saved GPU device list for CPU migration: cleared from model->devices so the
+    // next context creation skips the CUDA backend and its scratch buffer allocation.
+    // Restored when migrating back to GPU.
+    std::vector<llama_device> saved_devices;
 };
