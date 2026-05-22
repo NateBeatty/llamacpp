@@ -1,6 +1,10 @@
 
 #include "server-context.h"
 #include "server-chat.h"
+
+// forward declaration — implemented in src/llama-migrate.cpp, linked via libllama
+extern "C" LLAMA_API bool llama_model_migrate(struct llama_model * model, int32_t n_gpu_layers,
+                                              const struct llama_model_tensor_buft_override * tensor_buft_overrides);
 #include "server-common.h"
 #include "server-http.h"
 #include "server-task.h"
@@ -2147,6 +2151,58 @@ private:
                     params_base.lora_adapters = new_loras;
                     auto res = std::make_unique<server_task_result_apply_lora>();
                     res->id = task.id;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_MIGRATE:
+                {
+                    const int32_t n_gpu = task.migrate_n_gpu_layers;
+                    SRV_INF("migrating model weights to n_gpu_layers=%d\n", n_gpu);
+
+                    auto res = std::make_unique<server_task_result_migrate>();
+                    res->id = task.id;
+
+                    // Destroy current context (KV cache lives here); keep model alive.
+                    llama_init->reset_context(nullptr);
+                    ctx_tgt = nullptr;
+
+                    // Hot-swap weight tensors between GPU and CPU.
+                    // Pass tensor_buft_overrides so that pinned-CPU tensors (e.g. from
+                    // --n-cpu-moe) are respected and don't get moved to GPU.
+                    const auto * overrides = params_base.tensor_buft_overrides.empty()
+                        ? nullptr : params_base.tensor_buft_overrides.data();
+                    if (!llama_model_migrate(model_tgt, n_gpu, overrides)) {
+                        res->success      = false;
+                        res->n_gpu_layers = params_base.n_gpu_layers;
+                        res->error        = "llama_model_migrate failed (insufficient VRAM?)";
+                        SRV_ERR("%s\n", res->error.c_str());
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+
+                    // Recreate the context from the (now migrated) model.
+                    auto cparams = common_context_params_to_llama(params_base);
+                    llama_context_ptr new_ctx(llama_init_from_model(model_tgt, cparams));
+                    if (!new_ctx) {
+                        res->success      = false;
+                        res->n_gpu_layers = params_base.n_gpu_layers;
+                        res->error        = "llama_init_from_model failed after migration";
+                        SRV_ERR("%s\n", res->error.c_str());
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+
+                    llama_init->reset_context(std::move(new_ctx));
+                    ctx_tgt = llama_init->context();
+
+                    // Reset all slot state — KV entries from the old context are gone.
+                    for (auto & slot : slots) {
+                        slot.ctx_tgt = ctx_tgt;
+                        slot.reset();
+                    }
+
+                    params_base.n_gpu_layers = n_gpu;
+                    res->success      = true;
+                    res->n_gpu_layers = n_gpu;
                     queue_results.send(std::move(res));
                 } break;
         }
@@ -4324,6 +4380,42 @@ void server_routes::init_routes() {
         }
 
         GGML_ASSERT(dynamic_cast<server_task_result_apply_lora*>(result.get()) != nullptr);
+        res->ok(result->to_json());
+        return res;
+    };
+
+    this->post_migrate = [this](const server_http_req & req) {
+        auto res = create_response();
+        const json body = json::parse(req.body);
+
+        int32_t n_gpu_layers = 0;
+        if (body.contains("n_gpu_layers")) {
+            n_gpu_layers = body.at("n_gpu_layers").get<int32_t>();
+        } else {
+            res->error(format_error_response("Missing required field: n_gpu_layers", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_MIGRATE);
+            task.id = rd.get_new_id();
+            task.migrate_n_gpu_layers = n_gpu_layers;
+            rd.post_task(std::move(task));
+        }
+
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        GGML_ASSERT(dynamic_cast<server_task_result_migrate*>(result.get()) != nullptr);
         res->ok(result->to_json());
         return res;
     };
