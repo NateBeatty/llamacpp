@@ -2161,6 +2161,24 @@ private:
                     auto res = std::make_unique<server_task_result_migrate>();
                     res->id = task.id;
 
+                    // ── Save KV cache state before destroying the old context ────────
+                    // llama_state_get_data serialises KV tensors via ggml_backend_tensor_get,
+                    // which is device-agnostic, so the buffer can be restored into a context
+                    // on a different device (GPU→CPU or CPU→GPU).
+                    std::vector<uint8_t> kv_state;
+                    if (ctx_tgt) {
+                        const size_t state_sz = llama_state_get_size(ctx_tgt);
+                        kv_state.resize(state_sz);
+                        const size_t written = llama_state_get_data(ctx_tgt, kv_state.data(), state_sz);
+                        if (written != state_sz) {
+                            SRV_WRN("KV state save: got %zu/%zu bytes — cache will not be preserved\n",
+                                    written, state_sz);
+                            kv_state.clear();
+                        } else {
+                            SRV_INF("KV state saved: %.1f MiB\n", state_sz / 1048576.0);
+                        }
+                    }
+
                     // Destroy current context (KV cache lives here); keep model alive.
                     llama_init->reset_context(nullptr);
                     ctx_tgt = nullptr;
@@ -2194,6 +2212,20 @@ private:
                     llama_init->reset_context(std::move(new_ctx));
                     ctx_tgt = llama_init->context();
 
+                    // ── Restore KV state into the new context ────────────────────────
+                    bool kv_restored = false;
+                    if (!kv_state.empty()) {
+                        const size_t consumed = llama_state_set_data(ctx_tgt, kv_state.data(), kv_state.size());
+                        if (consumed > 0) {
+                            SRV_INF("KV state restored: %.1f MiB\n", consumed / 1048576.0);
+                            kv_restored = true;
+                        } else {
+                            SRV_WRN("%s", "KV state restore failed — cache cleared\n");
+                        }
+                        kv_state.clear();
+                        kv_state.shrink_to_fit();
+                    }
+
                     // Migrate the draft/MTP model if one is loaded.
                     if (model_dft) {
                         ctx_dft.reset();  // free old draft context first
@@ -2224,12 +2256,31 @@ private:
                         }
                     }
 
-                    // Reset all slot state — KV entries from the old context are gone.
+                    // Update slot context pointers.  When the KV state was successfully
+                    // restored, preserve slot metadata (n_past, cache_tokens, etc.) so
+                    // inference can resume without reprocessing the prompt.  The sampler
+                    // association must be cleared because it referenced the old context.
+                    // When KV state was not restored, do a full slot reset as before.
                     for (auto & slot : slots) {
                         slot.ctx_tgt = ctx_tgt;
                         slot.ctx_dft = ctx_dft.get();
                         slot.spec    = spec.get();
-                        slot.reset();
+                        if (kv_restored) {
+                            // Clear per-batch transient state that is stale after context
+                            // recreation.  n_past / cache_tokens / task are preserved so
+                            // that in-progress inference can resume on the new device.
+                            slot.i_batch = -1;
+                            llama_set_sampler(ctx_tgt, slot.id, nullptr);
+                            if (slot.can_speculate()) {
+                                // Draft context was recreated; any in-flight speculative
+                                // tokens are now orphaned and must be discarded.
+                                slot.spec_draft.clear();
+                                slot.spec_i_batch.clear();
+                                slot.spec_ckpt.clear();
+                            }
+                        } else {
+                            slot.reset();
+                        }
                     }
 
                     params_base.n_gpu_layers = n_gpu;
